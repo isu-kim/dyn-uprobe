@@ -171,7 +171,6 @@ func matchELFSymbol(binPath string, functionName string) (binSymbol, error) {
 		}
 		// The best case, we found a 100% matching symbol.
 		if sym == functionName {
-			log.Printf("Found matching symbol: %s at 0x%x (%s)\n", sym, addr, binPath)
 			return binSymbol{symbol: functionName, address: addr}, nil
 		}
 	}
@@ -183,28 +182,7 @@ func matchELFSymbol(binPath string, functionName string) (binSymbol, error) {
 		// Return the one that contains the function's name.
 		return symContained[0], nil
 	} else {
-		// Make user choose.
-		// @todo update this as auto selection by context.
-		var selection int
-
-		// Prompt user selection options.
-		for i, val := range symContained {
-			log.Printf("%d) %s\n", i, val.symbol)
-		}
-
-		_, err := fmt.Scanln(&selection)
-		if err != nil {
-			log.Fatal("Could not process input: ", err)
-			return binSymbol{}, err
-		}
-
-		// Return user's selection.
-		if selection >= 0 && selection < len(symContained) {
-			return symContained[selection], nil
-		} else {
-			log.Fatal("Wrong input: ", selection)
-			return binSymbol{}, err
-		}
+		return binSymbol{}, nil
 	}
 }
 
@@ -242,7 +220,6 @@ func checkBinarySymbol(binPath string, functionName string) (string, string, err
 	// If symbol's address was 0, this means that this is a shared library.
 	// Use ldd and find all libraries that this binary uses.
 	if sym.address == 0 {
-		log.Printf("%s had symbol addr 0, looking for shared libraries...\n", sym.symbol)
 		libs, err := parseLdd(binPath)
 		if err != nil {
 			log.Fatalf("could not look for library dependencies: %v\n", err)
@@ -268,7 +245,6 @@ func checkBinarySymbol(binPath string, functionName string) (string, string, err
 		return "", "", errors.New("could not find symbol: " + sym.symbol)
 	} else {
 		// We got a perfect matching symbol.
-		log.Printf("found %s from %s\n", sym.symbol, binPath)
 		return binPath, sym.symbol, nil
 	}
 }

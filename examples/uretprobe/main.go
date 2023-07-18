@@ -58,7 +58,7 @@ func main() {
 
 	// Open a Uretprobe at the exit point of the symbol and attach
 	// the pre-compiled eBPF program to it.
-	up, err := ex.Uretprobe(symbol, objs.UretprobeBashReadline, nil)
+	up, err := ex.NewUretprobe(symbol, objs.UretprobeSSL_read, nil)
 	if err != nil {
 		log.Fatalf("creating uretprobe: %s", err)
 	}
@@ -109,6 +109,6 @@ func main() {
 			continue
 		}
 
-		log.Printf("%s:%s return value: %s", binPath, symbol, unix.ByteSliceToString(event.Line[:]))
+		log.Printf("%s:%s buffer: %s (size %d) - returned %d", binPath, symbol, unix.ByteSliceToString(event.Buf[:]), event.BufSize, event.Ret)
 	}
 }

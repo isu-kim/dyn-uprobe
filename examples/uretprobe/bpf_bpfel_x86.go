@@ -13,8 +13,10 @@ import (
 )
 
 type bpfEvent struct {
-	Pid  uint32
-	Line [80]uint8
+	Pid     uint32
+	Buf     [80]uint8
+	BufSize uint32
+	Ret     int32
 }
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -58,8 +60,7 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
-	UprobeBashReadline    *ebpf.ProgramSpec `ebpf:"uprobe_bash_readline"`
-	UretprobeBashReadline *ebpf.ProgramSpec `ebpf:"uretprobe_bash_readline"`
+	UretprobeSSL_read *ebpf.ProgramSpec `ebpf:"uretprobe_SSL_read"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
@@ -101,14 +102,12 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
-	UprobeBashReadline    *ebpf.Program `ebpf:"uprobe_bash_readline"`
-	UretprobeBashReadline *ebpf.Program `ebpf:"uretprobe_bash_readline"`
+	UretprobeSSL_read *ebpf.Program `ebpf:"uretprobe_SSL_read"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
-		p.UprobeBashReadline,
-		p.UretprobeBashReadline,
+		p.UretprobeSSL_read,
 	)
 }
 
