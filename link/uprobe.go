@@ -5,7 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cilium/ebpf"
+	"log"
 	"os"
+	"os/exec"
+	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/isu-kim/dyn-uprobe/internal"
@@ -40,6 +44,12 @@ type Executable struct {
 	addresses map[string]uint64
 	// Keep track of symbol table lazy load.
 	addressesOnce sync.Once
+}
+
+// binSymbol will store a binary symbol's name and its address.
+type binSymbol struct {
+	symbol  string
+	address uint64
 }
 
 // UprobeOptions defines additional parameters that will be used
@@ -84,6 +94,183 @@ func (uo *UprobeOptions) cookie() uint64 {
 		return 0
 	}
 	return uo.Cookie
+}
+
+func load(f *internal.SafeELFFile) (map[string]uint64, error) {
+	ret := make(map[string]uint64)
+
+	syms, err := f.Symbols()
+	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
+		return ret, err
+	}
+
+	dynsyms, err := f.DynamicSymbols()
+	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
+		return ret, err
+	}
+
+	syms = append(syms, dynsyms...)
+
+	for _, s := range syms {
+		if elf.ST_TYPE(s.Info) != elf.STT_FUNC {
+			// Symbol not associated with a function or other executable code.
+			continue
+		}
+
+		address := s.Value
+
+		// Loop over ELF segments.
+		for _, prog := range f.Progs {
+			// Skip uninteresting segments.
+			if prog.Type != elf.PT_LOAD || (prog.Flags&elf.PF_X) == 0 {
+				continue
+			}
+
+			if prog.Vaddr <= s.Value && s.Value < (prog.Vaddr+prog.Memsz) {
+				// If the symbol value is contained in the segment, calculate
+				// the symbol offset.
+				//
+				// fn symbol offset = fn symbol VA - .text VA + .text offset
+				//
+				// stackoverflow.com/a/40249502
+				address = s.Value - prog.Vaddr + prog.Off
+				break
+			}
+		}
+		ret[s.Name] = address
+	}
+
+	return ret, nil
+}
+
+// matchELFSymbol will find function from binary file and retrieve the address of the symbol
+func matchELFSymbol(binPath string, functionName string) (binSymbol, error) {
+	// OpenSafeELFFile, the function originated from eBPF's code.
+	sf, err := internal.OpenSafeELFFile(binPath)
+	if err != nil {
+		log.Fatalf("failed to open file: %v\n", err)
+		return binSymbol{}, err
+	}
+
+	// Load addresses and symbols of symbols.
+	addresses, err := load(sf)
+	if err != nil {
+		log.Fatal("Could not load SafeELFFile: ", err)
+		return binSymbol{}, err
+	}
+
+	// List all symbols found.
+	symContained := make([]binSymbol, 0)
+
+	// Look for the symbol containing or 100% matching the function Name we want.
+	for sym, addr := range addresses {
+		// Meh... case, we found symbols containing function's name.
+		if strings.Contains(sym, functionName) {
+			newEntry := binSymbol{symbol: sym, address: addr}
+			symContained = append(symContained, newEntry)
+		}
+		// The best case, we found a 100% matching symbol.
+		if sym == functionName {
+			log.Printf("Found matching symbol: %s at 0x%x (%s)\n", sym, addr, binPath)
+			return binSymbol{symbol: functionName, address: addr}, nil
+		}
+	}
+
+	// Check for the symbols containing the function name that we are looking for.
+	if len(symContained) == 0 {
+		return binSymbol{}, errors.New("symbol does not exist")
+	} else if len(symContained) == 1 {
+		// Return the one that contains the function's name.
+		return symContained[0], nil
+	} else {
+		// Make user choose.
+		// @todo update this as auto selection by context.
+		var selection int
+
+		// Prompt user selection options.
+		for i, val := range symContained {
+			log.Printf("%d) %s\n", i, val.symbol)
+		}
+
+		_, err := fmt.Scanln(&selection)
+		if err != nil {
+			log.Fatal("Could not process input: ", err)
+			return binSymbol{}, err
+		}
+
+		// Return user's selection.
+		if selection >= 0 && selection < len(symContained) {
+			return symContained[selection], nil
+		} else {
+			log.Fatal("Wrong input: ", selection)
+			return binSymbol{}, err
+		}
+	}
+}
+
+// parseLdd returns all libraries' full paths.
+func parseLdd(binaryPath string) ([]string, error) {
+	// Execute the ldd command
+	cmd := exec.Command("ldd", binaryPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse the ldd output
+	libs := make([]string, 0)
+	lines := strings.Split(string(output), "\n")
+	regex := regexp.MustCompile(`^\s*(.*?)\s*=>\s*(.*?)\s*\(.*$`)
+	for _, line := range lines {
+		match := regex.FindStringSubmatch(line)
+		if len(match) == 3 {
+			libs = append(libs, match[2])
+		}
+	}
+
+	return libs, nil
+}
+
+func checkBinarySymbol(binPath string, functionName string) (string, string, error) {
+	// Match ELF symbol first to check the address of the symbol.
+	sym, err := matchELFSymbol(binPath, functionName)
+	if err != nil {
+		log.Fatalf("could not match ELF symbol: %v\n", err)
+		return "", "", err
+	}
+
+	// If symbol's address was 0, this means that this is a shared library.
+	// Use ldd and find all libraries that this binary uses.
+	if sym.address == 0 {
+		log.Printf("%s had symbol addr 0, looking for shared libraries...\n", sym.symbol)
+		libs, err := parseLdd(binPath)
+		if err != nil {
+			log.Fatalf("could not look for library dependencies: %v\n", err)
+			return "", "", err
+		}
+
+		// For all libraries, look for the symbol that matches the required symbol.
+		for _, lib := range libs {
+			// The library contains binary path, no idea why :(
+			if lib == binPath {
+				continue
+			}
+
+			sym, err := matchELFSymbol(lib, sym.symbol)
+			if err != nil {
+				continue
+			} else {
+				// Yes we found a case.
+				return lib, sym.symbol, nil
+			}
+		}
+		// Something went on wrong.
+		return "", "", errors.New("could not find symbol: " + sym.symbol)
+	} else {
+		// We got a perfect matching symbol.
+		log.Printf("found %s from %s\n", sym.symbol, binPath)
+		return binPath, sym.symbol, nil
+	}
 }
 
 // To open a new Executable, use:
@@ -202,6 +389,28 @@ func (ex *Executable) address(symbol string, opts *UprobeOptions) (uint64, error
 	return address + opts.Offset, nil
 }
 
+// NewUprobe is for attaching a symbol to executable file with dynamic symbols.
+func (ex *Executable) NewUprobe(symbol string, prog *ebpf.Program, opts *UprobeOptions) (Link, error) {
+	fmt.Println("Modified Uprobe!! Supports Dynamic Linking")
+
+	// Check binPath file exists.
+	if _, err := os.Stat(ex.path); os.IsNotExist(err) {
+		log.Fatalf("file %s does not exist\n", ex.path)
+	}
+
+	// Check actual binary and actual symbol.
+	actualBin, actualSym, err := checkBinarySymbol(ex.path, symbol)
+	if err != nil {
+		log.Fatalf("could not find actual ELF symbol: %v\n", err)
+		return nil, nil
+	}
+
+	// Modify the actual binary file for the executable.
+	ex.path = actualBin
+
+	return ex.Uprobe(actualSym, prog, opts)
+}
+
 // Uprobe attaches the given eBPF program to a perf event that fires when the
 // given symbol starts executing in the given Executable.
 // For example, /bin/bash::main():
@@ -222,8 +431,8 @@ func (ex *Executable) address(symbol string, opts *UprobeOptions) (uint64, error
 //
 // Functions provided by shared libraries can currently not be traced and
 // will result in an ErrNotSupported.
+
 func (ex *Executable) Uprobe(symbol string, prog *ebpf.Program, opts *UprobeOptions) (Link, error) {
-	fmt.Println("Modified Uprobe!! Supports Dynamic Linking")
 	u, err := ex.uprobe(symbol, prog, opts, false)
 	if err != nil {
 		return nil, err
@@ -236,6 +445,27 @@ func (ex *Executable) Uprobe(symbol string, prog *ebpf.Program, opts *UprobeOpti
 	}
 
 	return lnk, nil
+}
+
+func (ex *Executable) NewUretprobe(symbol string, prog *ebpf.Program, opts *UprobeOptions) (Link, error) {
+	fmt.Println("Modified NewUretprobe!! Supports Dynamic Linking")
+
+	// Check binPath file exists.
+	if _, err := os.Stat(ex.path); os.IsNotExist(err) {
+		log.Fatalf("file %s does not exist\n", ex.path)
+	}
+
+	// Check actual binary and actual symbol.
+	actualBin, actualSym, err := checkBinarySymbol(ex.path, symbol)
+	if err != nil {
+		log.Fatalf("could not find actual ELF symbol: %v\n", err)
+		return nil, nil
+	}
+
+	// Modify the actual binary file for the executable.
+	ex.path = actualBin
+
+	return ex.Uretprobe(actualSym, prog, opts)
 }
 
 // Uretprobe attaches the given eBPF program to a perf event that fires right
@@ -258,7 +488,6 @@ func (ex *Executable) Uprobe(symbol string, prog *ebpf.Program, opts *UprobeOpti
 // Functions provided by shared libraries can currently not be traced and
 // will result in an ErrNotSupported.
 func (ex *Executable) Uretprobe(symbol string, prog *ebpf.Program, opts *UprobeOptions) (Link, error) {
-	fmt.Println("Modified Uretprobe!! Supports Dynamic Linking")
 	u, err := ex.uprobe(symbol, prog, opts, true)
 	if err != nil {
 		return nil, err

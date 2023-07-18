@@ -30,7 +30,7 @@ const (
 	// dynamically-linked library, so the path of the library will need
 	// to be specified instead, e.g. /usr/lib/libreadline.so.8.
 	// Use `ldd /bin/bash` to find these paths.
-	binPath = "/lib/x86_64-linux-gnu/libssl.so.3"
+	binPath = "/usr/sbin/nginx"
 	symbol  = "SSL_read"
 )
 
